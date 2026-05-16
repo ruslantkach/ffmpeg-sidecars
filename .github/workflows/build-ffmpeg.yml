@@ -144,6 +144,7 @@ jobs:
             --disable-libxcb-shm \
             --disable-libxcb-shape \
             --disable-libxcb-xfixes \
+            --disable-xlib \
             --extra-cflags="$EXTRA_CFLAGS" \
             --extra-ldflags="$EXTRA_LDFLAGS" \
             "${CROSS_ARGS[@]}"
