@@ -1,0 +1,208 @@
+# Build FFmpeg sidecar binaries for the FMOD Menubar Tauri app.
+#
+# Produces LGPL-only FFmpeg binaries for macOS arm64 and macOS x86_64,
+# strips them, ad-hoc signs, and attaches both to a GitHub Release.
+# The `scripts/install-ffmpeg-sidecar.sh` script in this repo downloads
+# from that release with a pinned SHA256 — making the supply chain end-
+# to-end reproducible: anyone can fork this repo, run the workflow, and
+# get bit-for-bit identical binaries (modulo the upstream FFmpeg source
+# tarball, which is pinned by tag).
+#
+# Why LGPL and not GPL:
+#   The menubar app is MIT/Apache. Bundling a GPL-configured FFmpeg
+#   would require source release + GPL relicensing of the parent app.
+#   We compile with --disable-gpl --disable-nonfree which omits libx264,
+#   libx265, libvidstab, etc. — none of which we use anyway (we only
+#   decode/encode PCM WAV and run audio filters from libavfilter).
+#
+# Triggering:
+#   - On any push of a tag matching `ffmpeg-*` (e.g. ffmpeg-8.1.1).
+#   - Manually via the "Run workflow" button (workflow_dispatch).
+#
+# Outputs:
+#   A GitHub Release named after the tag, with two attached binaries:
+#     ffmpeg-aarch64-apple-darwin
+#     ffmpeg-x86_64-apple-darwin
+#   plus a SHA256SUMS file the install script verifies against.
+
+name: Build FFmpeg sidecar
+
+on:
+  push:
+    tags:
+      - "ffmpeg-*"
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: "FFmpeg version tag to build (e.g. n8.1.1)"
+        required: true
+        default: "n8.1.1"
+      release_tag:
+        description: "GitHub release tag to create (e.g. ffmpeg-8.1.1)"
+        required: true
+        default: "ffmpeg-8.1.1"
+
+permissions:
+  contents: write  # needed to upload release artifacts
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-14 is GitHub-hosted Apple Silicon (M1+). The host arch
+          # is arm64; we build natively, no cross-compile.
+          - os: macos-14
+            arch: aarch64
+            triple: aarch64-apple-darwin
+          # macos-13 is GitHub-hosted Intel. Builds natively.
+          - os: macos-13
+            arch: x86_64
+            triple: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Resolve FFmpeg version
+        id: resolve
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.ffmpeg_version }}" ]]; then
+            VERSION="${{ inputs.ffmpeg_version }}"
+          else
+            # Tag form: ffmpeg-8.1.1 → FFmpeg tag n8.1.1
+            VERSION="n${GITHUB_REF_NAME#ffmpeg-}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building FFmpeg $VERSION for ${{ matrix.triple }}"
+
+      - name: Install LGPL build dependencies (Homebrew)
+        # libsoxr gives us a transparent resampler for the loudnorm
+        # 2-pass renderer. Everything else here is an LGPL-safe addition.
+        # We deliberately do NOT install x264, x265, fdk-aac, lame, etc.
+        run: |
+          brew update
+          brew install nasm pkg-config libsoxr
+
+      - name: Clone FFmpeg
+        run: |
+          git clone --depth 1 \
+            --branch "${{ steps.resolve.outputs.version }}" \
+            https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+
+      - name: Configure (LGPL-only)
+        working-directory: ffmpeg-src
+        run: |
+          ./configure \
+            --prefix="${GITHUB_WORKSPACE}/ffmpeg-install" \
+            --disable-gpl \
+            --disable-nonfree \
+            --disable-shared \
+            --enable-static \
+            --disable-debug \
+            --disable-doc \
+            --disable-htmlpages \
+            --disable-manpages \
+            --disable-podpages \
+            --disable-txtpages \
+            --disable-ffplay \
+            --disable-ffprobe \
+            --enable-libsoxr \
+            --extra-ldflags="-Wl,-no_compact_unwind"
+          echo "--- FFmpeg configure summary follows ---"
+          tail -n 80 ffbuild/config.log 2>/dev/null || true
+
+      - name: Build
+        working-directory: ffmpeg-src
+        run: |
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+
+      - name: Strip + ad-hoc sign + verify
+        run: |
+          BIN="${GITHUB_WORKSPACE}/ffmpeg-install/bin/ffmpeg"
+          if [[ ! -x "$BIN" ]]; then
+            echo "ffmpeg not produced at $BIN" >&2
+            exit 1
+          fi
+          # Strip non-essential symbols to shrink the binary.
+          strip "$BIN" || true
+          # Remove any quarantine xattr and ad-hoc sign so the binary
+          # passes basic Gatekeeper checks. The consuming `tauri build`
+          # will re-sign with the parent app's Developer ID at bundle
+          # time, replacing this ad-hoc signature.
+          xattr -cr "$BIN" || true
+          codesign --force --sign - --options runtime "$BIN"
+          file "$BIN"
+          "$BIN" -version | head -3
+
+      - name: Stage binary with target-triple name
+        run: |
+          mkdir -p staged
+          cp "ffmpeg-install/bin/ffmpeg" "staged/ffmpeg-${{ matrix.triple }}"
+          # Compute SHA256 for the release manifest.
+          shasum -a 256 "staged/ffmpeg-${{ matrix.triple }}" \
+            | awk '{print $1 "  ffmpeg-${{ matrix.triple }}"}' \
+            > "staged/ffmpeg-${{ matrix.triple }}.sha256"
+          ls -la staged/
+
+      - name: Upload artifact (for cross-job aggregation)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.triple }}
+          path: staged/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Flatten + build SHA256SUMS
+        run: |
+          mkdir -p release/
+          find artifacts/ -type f -name "ffmpeg-*-apple-darwin" -exec cp {} release/ \;
+          cd release
+          shasum -a 256 ffmpeg-*-apple-darwin > SHA256SUMS
+          cat SHA256SUMS
+          ls -la
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.release_tag }}" ]]; then
+            echo "tag=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body: |
+            LGPL FFmpeg sidecar binaries for the FMOD Menubar Tauri app.
+
+            Built from upstream FFmpeg source at the tag matching this
+            release (e.g. `ffmpeg-8.1.1` → FFmpeg `n8.1.1`).
+            Configure flags: `--disable-gpl --disable-nonfree
+            --disable-shared --enable-static --enable-libsoxr`.
+
+            Both binaries are ad-hoc signed; the consuming app re-signs
+            them with its Developer ID at `tauri build` time.
+
+            Verify with the included `SHA256SUMS`:
+            ```
+            shasum -a 256 -c SHA256SUMS
+            ```
+          files: |
+            release/ffmpeg-aarch64-apple-darwin
+            release/ffmpeg-x86_64-apple-darwin
+            release/SHA256SUMS
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

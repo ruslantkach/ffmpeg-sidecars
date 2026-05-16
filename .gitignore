@@ -1,0 +1,19 @@
+# Locally-staged build artifacts. Real builds happen in GitHub Actions
+# and produce release artifacts directly; nothing build-related should
+# ever be committed to this repo.
+ffmpeg-src/
+ffmpeg-install/
+staged/
+release/
+artifacts/
+*.zip
+*.tar.gz
+*.tar.xz
+
+# macOS noise
+.DS_Store
+
+# Editor noise
+.vscode/
+.idea/
+*.swp
