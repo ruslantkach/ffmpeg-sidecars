@@ -51,16 +51,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-14 is GitHub-hosted Apple Silicon (M1+). The host arch
-          # is arm64; we build natively, no cross-compile.
-          - os: macos-14
-            arch: aarch64
+          # Native arm64 build on Apple Silicon.
+          - arch: aarch64
             triple: aarch64-apple-darwin
-          # macos-13 is GitHub-hosted Intel. Builds natively.
-          - os: macos-13
-            arch: x86_64
+            file_arch: arm64
+          # Cross-compiled x86_64 build, also on macos-14. We don't use
+          # macos-13 Intel runners because GitHub has been deprecating
+          # them — they're scarce and queue times are unpredictable. The
+          # macos-14 toolchain (clang + Apple SDK) supports `-arch x86_64`
+          # as a cross-compile target out of the box, so we can produce
+          # real Intel binaries on an arm64 host with no extra setup.
+          - arch: x86_64
             triple: x86_64-apple-darwin
-    runs-on: ${{ matrix.os }}
+            file_arch: x86_64
+    runs-on: macos-14
     steps:
       - name: Resolve FFmpeg version
         id: resolve
@@ -94,8 +98,26 @@ jobs:
             https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
 
       - name: Configure (LGPL-only)
+        # For x86_64, we cross-compile on the macos-14 arm64 host:
+        # clang's `-arch x86_64` flag picks the Intel slice from Apple's
+        # universal SDK. FFmpeg's --enable-cross-compile suppresses
+        # configure's "run a test program" probes (which would otherwise
+        # need Rosetta) and treats the host and target as different.
         working-directory: ffmpeg-src
         run: |
+          EXTRA_CFLAGS=""
+          EXTRA_LDFLAGS="-Wl,-no_compact_unwind"
+          CROSS_ARGS=()
+          if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+            EXTRA_CFLAGS="-arch x86_64"
+            EXTRA_LDFLAGS="$EXTRA_LDFLAGS -arch x86_64"
+            CROSS_ARGS=(
+              --enable-cross-compile
+              --arch=x86_64
+              --target-os=darwin
+              --cc=clang
+            )
+          fi
           ./configure \
             --prefix="${GITHUB_WORKSPACE}/ffmpeg-install" \
             --disable-gpl \
@@ -110,7 +132,9 @@ jobs:
             --disable-txtpages \
             --disable-ffplay \
             --disable-ffprobe \
-            --extra-ldflags="-Wl,-no_compact_unwind"
+            --extra-cflags="$EXTRA_CFLAGS" \
+            --extra-ldflags="$EXTRA_LDFLAGS" \
+            "${CROSS_ARGS[@]}"
           echo "--- FFmpeg configure summary follows ---"
           tail -n 80 ffbuild/config.log 2>/dev/null || true
 
@@ -136,7 +160,16 @@ jobs:
           xattr -cr "$BIN" || true
           codesign --force --sign - --options runtime "$BIN"
           file "$BIN"
-          "$BIN" -version | head -3
+          # Verify the binary's architecture matches the matrix target.
+          # We don't `./ffmpeg -version` here because the x86_64 build
+          # is cross-compiled and may not run on the arm64 host without
+          # Rosetta. `file` is sufficient to confirm the build emitted
+          # the right Mach-O slice.
+          if ! file "$BIN" | grep -q "${{ matrix.file_arch }}"; then
+            echo "✗ Wrong architecture in $BIN — expected ${{ matrix.file_arch }}" >&2
+            file "$BIN" >&2
+            exit 1
+          fi
 
       - name: Stage binary with target-triple name
         run: |
