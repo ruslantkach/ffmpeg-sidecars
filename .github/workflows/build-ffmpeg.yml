@@ -76,12 +76,16 @@ jobs:
           echo "Building FFmpeg $VERSION for ${{ matrix.triple }}"
 
       - name: Install LGPL build dependencies (Homebrew)
-        # libsoxr gives us a transparent resampler for the loudnorm
-        # 2-pass renderer. Everything else here is an LGPL-safe addition.
         # We deliberately do NOT install x264, x265, fdk-aac, lame, etc.
+        # (GPL or nonfree). nasm is needed for FFmpeg's hand-tuned x86 asm.
+        # pkg-config is FFmpeg's standard tool for locating optional libs.
+        # We rely on FFmpeg's bundled swresample for resampling — no
+        # external resampler libs are linked, which keeps the binary
+        # self-contained (no runtime dylib dependencies outside system
+        # frameworks).
         run: |
           brew update
-          brew install nasm pkg-config libsoxr
+          brew install nasm pkg-config
 
       - name: Clone FFmpeg
         run: |
@@ -106,7 +110,6 @@ jobs:
             --disable-txtpages \
             --disable-ffplay \
             --disable-ffprobe \
-            --enable-libsoxr \
             --extra-ldflags="-Wl,-no_compact_unwind"
           echo "--- FFmpeg configure summary follows ---"
           tail -n 80 ffbuild/config.log 2>/dev/null || true
@@ -190,7 +193,7 @@ jobs:
             Built from upstream FFmpeg source at the tag matching this
             release (e.g. `ffmpeg-8.1.1` → FFmpeg `n8.1.1`).
             Configure flags: `--disable-gpl --disable-nonfree
-            --disable-shared --enable-static --enable-libsoxr`.
+            --disable-shared --enable-static`.
 
             Both binaries are ad-hoc signed; the consuming app re-signs
             them with its Developer ID at `tauri build` time.

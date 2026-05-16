@@ -22,7 +22,6 @@ FFmpeg is built with the following flags:
 --disable-nonfree
 --disable-shared
 --enable-static
---enable-libsoxr
 --disable-debug
 --disable-doc
 --disable-ffplay
@@ -34,8 +33,11 @@ or any other GPL-licensed components are included. Apps bundling this
 binary can stay under MIT/Apache/proprietary licenses without inheriting
 GPL obligations.
 
-`libsoxr` is included because it's a high-quality LGPL-compatible
-resampler used by `aresample` for transparent sample-rate conversion.
+No external resampler is linked — FFmpeg's bundled `swresample` handles
+all sample-rate conversion via the `aresample` filter. Keeping the build
+free of external resampler libs (like libsoxr) means the resulting
+binary has no Homebrew/dylib runtime dependencies and ships
+self-contained.
 
 ## Architectures
 
