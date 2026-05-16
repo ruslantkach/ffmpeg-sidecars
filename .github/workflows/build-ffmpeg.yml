@@ -118,6 +118,14 @@ jobs:
               --cc=clang
             )
           fi
+          # --disable-libxcb* prevents FFmpeg from auto-linking the
+          # Homebrew X11 client libraries — the macos-14 runner image
+          # has XQuartz installed, so configure picks libxcb up by
+          # default. Linking it makes the resulting binary depend on
+          # /opt/homebrew/opt/libxcb/lib/libxcb.1.dylib, which won't
+          # exist on end-user Macs without Homebrew + XQuartz. These
+          # libs are only used by FFmpeg's x11/xcb screen-grab inputs,
+          # which are Linux-only features anyway.
           ./configure \
             --prefix="${GITHUB_WORKSPACE}/ffmpeg-install" \
             --disable-gpl \
@@ -132,6 +140,10 @@ jobs:
             --disable-txtpages \
             --disable-ffplay \
             --disable-ffprobe \
+            --disable-libxcb \
+            --disable-libxcb-shm \
+            --disable-libxcb-shape \
+            --disable-libxcb-xfixes \
             --extra-cflags="$EXTRA_CFLAGS" \
             --extra-ldflags="$EXTRA_LDFLAGS" \
             "${CROSS_ARGS[@]}"
@@ -170,6 +182,25 @@ jobs:
             file "$BIN" >&2
             exit 1
           fi
+          # Portability audit: every linked dylib must live in a path
+          # that's guaranteed to exist on every macOS install. Anything
+          # under /opt/homebrew, /usr/local, $HOME, or other non-system
+          # prefixes means FFmpeg's configure picked up a Homebrew lib
+          # and the binary will fail to launch on end-user machines
+          # without that exact install.
+          echo "--- dylib audit ---"
+          otool -L "$BIN"
+          NON_SYSTEM_DEPS="$(otool -L "$BIN" \
+            | awk 'NR>1 {print $1}' \
+            | grep -Ev '^(/usr/lib/|/System/)' \
+            || true)"
+          if [[ -n "$NON_SYSTEM_DEPS" ]]; then
+            echo "✗ Binary has non-system dylib dependencies:" >&2
+            echo "$NON_SYSTEM_DEPS" >&2
+            echo "Add --disable-* flags to configure to drop these." >&2
+            exit 1
+          fi
+          echo "✓ All dylib deps are system-provided"
 
       - name: Stage binary with target-triple name
         run: |
